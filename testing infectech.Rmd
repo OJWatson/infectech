@@ -1,0 +1,270 @@
+---
+title: "testing infectech"
+author: "Paula Christen"
+date: "2024-09-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare for analyses
+```{r }
+#install.packages("scoringutils", version = "1.2.2", repos = "https://epiforecasts.r-universe.dev")
+library(scoringutils)
+library(ggplot2)
+library(magrittr)
+library(infectech)
+library(xml2)
+library(rvest)
+library(tidyverse)
+library(dplyr)
+library(infectech)
+source("R/plot_functions.R")
+source("R/prep_forecast.R")
+```
+
+## Testing Infectech package utilities
+
+### Read in data from github
+
+```{r infectech}
+
+# specify data source (general url)
+URL <- "https://mrcdata.dide.ic.ac.uk/global-lmic-reports" #requirement to be connected via zscaler
+
+pg <- read_html(URL)
+
+# get all html links on source page
+links <- html_attr(html_nodes(pg, "a"), "href")
+
+# remove all links not ending with csv or zip
+links <- grep("\\.zip$|\\.csv$", links, value = TRUE)
+
+# report date(s) (or names if there are multiple links)
+dates <- c("2021-01-12")
+
+# subset vector with links to try functions
+links_sub <- grep(dates, links, value = TRUE)
+
+#download files and bind to master_df
+master_df <- data.frame()
+
+for(link in links_sub){
+  temp <- tempfile()
+  full_link <- paste0("https://mrcdata.dide.ic.ac.uk/global-lmic-reports/", 
+                      link)
+  link_without_zip <- sub("\\.zip$", "", link)
+  download.file(full_link, temp)
+  data <- read.csv(unz(temp, link_without_zip))
+  unlink(temp)
+  master_df <- rbind(master_df, data)
+}
+
+#ensure date and report date are in date format
+master_df <- master_df %>%
+  dplyr::mutate(date = as.Date(date),
+                report_date = as.Date(report_date)) 
+```
+
+## Get observed
+
+```{r pressure, echo=FALSE}
+
+if (file.exists("reported_covid.rds")) { 
+  # If the file exists, read it in
+  combined_df <- readRDS("reported_covid.rds") 
+} else { 
+  # If the file doesn't exist, source the R script
+  source("R/get_observed_jhu.R")
+}
+
+combined_df <- combined_df %>%
+  pivot_longer(cols = c("deaths", "cases"),
+               names_to = c("compartment"),
+               values_to = "observed") %>%
+  dplyr::mutate(date = as.Date(date),
+                compartment = ifelse(compartment == "cases", "infections", compartment))
+
+#merge master_df with observed cases/deaths
+#standardize country names
+#filter specific outcome measures to analyse (here: deaths, infections)
+master_df <- merge(master_df, 
+                   combined_df, 
+                   by = c("iso3c", "date", "compartment"), 
+                   all = TRUE) %>%
+              dplyr::mutate(country = countrycode::countrycode(iso3c, "iso3c", "country.name.en", 
+                                              custom_match = c("KSV" = "Kosovo")))
+
+master_df <- master_df %>%
+  dplyr::filter(compartment %in% c("deaths", "infections")) 
+```
+
+
+#Example plotting: quantile forecast (1)
+
+```{r pressure, echo=FALSE}
+
+#Convert to forecast type
+df_forecast <- prep_forecast_data(data = master_df,
+                   forecast_type = "quantile",
+                   observed_column = "observed",
+                   predicted_column = NULL,
+                   quantile_columns = c("y_025", "y_25", "y_median", "y_75", "y_975"),
+                   quantile_values = c(0.025, 0.25, 0.5, 0.75, 0.975),
+                   forecast_date = "date",
+                   forecast_made = "report_date",
+                   metric = "compartment",
+                   model_column = "version",
+                   other_characteristic_columns = c("scenario"),
+                   location_col = "country")
+
+forecast <- df_forecast[[1]]
+charactertistics <- df_forecast[[2]]
+
+# get maximum and minimum dates where a prediction is available
+max_date <- forecast %>%
+  filter(!is.na(predicted)) %>%
+  mutate(forecast_date = as.Date(forecast_date, format = "%Y-%m-%d")) %>% # Add this line
+  summarize(max_date = max(forecast_date)) %>%
+  pull(max_date) 
+
+min_date <- forecast %>%
+  filter(!is.na(predicted)) %>%
+  mutate(forecast_date = as.Date(forecast_date, format = "%Y-%m-%d")) %>% # Add this line
+  summarize(min_date = min(forecast_date)) %>%
+  pull(min_date) 
+
+plot_df <- define_plot_df(data = forecast, 
+                    date_cutoff_predictions = NULL,
+                    pred_date_filter = NULL,
+                    vars_to_modify = "predicted", 
+                    locations_to_include = "South Africa", 
+                    metrics_to_plot = c("infections","deaths"), 
+                    plotting_window = c(min_date, "2020-07-01"))
+
+plot_df <- as.data.frame(plot_df)
+
+plot_df <- reshape(plot_df, 
+             idvar = c(charactertistics,"observed"), 
+             timevar = "quantile_level", 
+             direction = "wide")
+
+plot_df <- plot_df %>% filter(model != "")
+
+
+plot_forecasts(plot_df, 
+               wrap_by = c("scenario", "loc"), 
+               forecast_type = "quantile")
+
+```
+
+#Example plotting: quantile forecast (2)
+```{r}
+
+q = example_quantile$quantile_level
+q = paste(unique(q[!is.na(q)]), collapse = ", ")
+
+df_forecast <- prep_forecast_data(data = example_quantile,
+                   forecast_type = "quantile",
+                   observed_column = "observed",
+                   predicted_column = "predicted",
+                   quantile_columns = "quantile_level",
+                   quantile_values = q,
+                   forecast_date = "target_end_date",
+                   forecast_made = "forecast_date",
+                   metric = "target_type",
+                   model_column = "model",
+                   other_characteristic_columns = c("horizon"),
+                   location_col = "location_name")
+
+forecast <- df_forecast[[1]]
+charactertistics <- df_forecast[[2]]
+
+# get maximum and minimum dates where a prediction is available
+max_date <- forecast %>%
+  filter(!is.na(predicted)) %>%
+  mutate(forecast_date = as.Date(forecast_date, format = "%Y-%m-%d")) %>% # Add this line
+  summarize(max_date = max(forecast_date)) %>%
+  pull(max_date) 
+
+min_date <- forecast %>%
+  filter(!is.na(predicted)) %>%
+  mutate(forecast_date = as.Date(forecast_date, format = "%Y-%m-%d")) %>% # Add this line
+  summarize(min_date = min(forecast_date)) %>%
+  pull(min_date) 
+
+plot_df <- define_plot_df(data = forecast, 
+                    date_cutoff_predictions = as.Date("2021-01-02"),
+                    pred_date_filter = NULL,
+                    vars_to_modify = "predicted", 
+                    locations_to_include = "Germany",
+                    metrics_to_plot = "Cases", 
+                    plotting_window = c(min_date, max_date))
+
+plot_df <- as.data.frame(plot_df)
+
+plot_df <- reshape(plot_df, 
+             idvar = c(charactertistics,"observed"), 
+             timevar = "quantile_level", 
+             direction = "wide")
+
+plot_df <- plot_df %>% filter(model != "")
+
+plot_forecasts(plot_df, 
+               wrap_by = c("loc", "horizon", "model"), 
+               forecast_type = "quantile")
+
+#horizon: forecast horizon in weeks
+
+```
+
+#Example plotting: Point forecast
+```{r}
+df_forecast <- prep_forecast_data(data = example_point,
+                   forecast_type = "point",
+                   observed_column = "observed",
+                   predicted_column = "predicted",
+                   forecast_date = "target_end_date",
+                   forecast_made = "forecast_date",
+                   metric = "target_type",
+                   model_column = "model",
+                   other_characteristic_columns = c("horizon"),
+                   location_col = "location_name")
+  
+forecast <- df_forecast[[1]]
+charactertistics <- df_forecast[[2]]
+
+# get maximum and minimum dates where a prediction is available
+max_date <- forecast %>%
+  filter(!is.na(predicted)) %>%
+  mutate(forecast_date = as.Date(forecast_date, format = "%Y-%m-%d")) %>% # Add this line
+  summarize(max_date = max(forecast_date)) %>%
+  pull(max_date) 
+
+min_date <- forecast %>%
+  filter(!is.na(predicted)) %>%
+  mutate(forecast_date = as.Date(forecast_date, format = "%Y-%m-%d")) %>% # Add this line
+  summarize(min_date = min(forecast_date)) %>%
+  pull(min_date) 
+
+plot_df <- define_plot_df(data = forecast, 
+                    date_cutoff_predictions = as.Date("2021-01-02"),
+                    pred_date_filter = NULL,
+                    vars_to_modify = "predicted", 
+                    locations_to_include = "Italy",
+                    metrics_to_plot = "Cases", 
+                    plotting_window = c(min_date, max_date))
+
+plot_df <- as.data.frame(plot_df)
+
+plot_forecasts(plot_df, 
+               wrap_by = c("loc", "horizon", "model"), 
+               forecast_type = "point")
+
+```
+
+
+
+
